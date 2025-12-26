@@ -1,0 +1,23 @@
+2025-12-26 15:36:03,675 [INFO] Starting ASA-PPO Training...
+2025-12-26 15:36:03,675 [INFO] Device: cuda
+2025-12-26 15:36:03,675 [INFO] Model: Qwen/Qwen3-1.7B
+2025-12-26 15:36:03,675 [INFO] Initializing Real System Environment...
+2025-12-26 15:36:03,675 [INFO] Initializing Cloud API Client: https://dashscope.aliyuncs.com/compatible-mode/v1
+2025-12-26 15:36:03,736 [INFO] Loading local SLM from ModelScope: Qwen/Qwen3-1.7B...
+2025-12-26 15:36:04,679 [INFO] Using cached model at: /home/ubuntu/.cache/modelscope/hub/models/Qwen/Qwen3-1___7B
+2025-12-26 15:36:05,840 [INFO] Loading Datasets...
+2025-12-26 15:36:05,840 [INFO] Downloading/Loading datasets from ModelScope...
+2025-12-26 15:36:14,837 [INFO] [✓] opencompass/commonsense_qa (None/train) loaded: 9741 items
+2025-12-26 15:36:19,994 [INFO] [✓] opencompass/commonsense_qa (None/validation) loaded: 1221 items
+2025-12-26 15:36:20,263 [INFO] [✓] OpenBookQA (Manual) loaded: 5457 items
+2025-12-26 15:36:20,517 [INFO] [✓] OpenBookQA (Manual) loaded: 5457 items
+2025-12-26 15:36:26,033 [INFO] [✓] modelscope/ai2_arc (ARC-Challenge/train) loaded: 1119 items
+2025-12-26 15:36:31,874 [INFO] [✓] modelscope/ai2_arc (ARC-Challenge/validation) loaded: 299 items
+2025-12-26 15:36:40,118 [INFO] [✓] AI-ModelScope/MATH-500 (default/test) loaded: 500 items
+2025-12-26 15:36:40,118 [INFO] Total samples loaded: 23794
+2025-12-26 15:36:40,118 [INFO] Initializing ASA-PPO Agent...
+2025-12-26 15:36:40,129 [INFO] Start Training for 200 episodes...
+2025-12-26 15:37:33,725 [INFO] --- [Turn 3] OOM Triggered! ---
+2025-12-26 15:38:30,642 [INFO] --- [Turn 3] OOM Triggered! ---
+2025-12-26 15:41:25,037 [INFO] --- [Turn 2] OOM Triggered! ---
+2025-12-26 15:41:44,237 [INFO] --- [Turn 1] OOM Triggered! ---
