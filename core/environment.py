@@ -227,8 +227,7 @@ class VectorizedRealSystemEnv:
         """
         使用真实 Masking 对整个 Batch 运行生成。
         """
-        batch_input_ids = []
-        batch_attention_mask = []
+        batch_features = []
         
         for i in range(self.num_envs):
             state = self.envs_states[i]
@@ -252,12 +251,20 @@ class VectorizedRealSystemEnv:
                 
             full_mask = h_mask + [1] * len(new_q)
             
-            batch_input_ids.append(torch.tensor(full_input, dtype=torch.long))
-            batch_attention_mask.append(torch.tensor(full_mask, dtype=torch.long))
+            batch_features.append({
+                'input_ids': full_input,
+                'attention_mask': full_mask
+            })
 
-        # Pad Sequence
-        padded_input = torch.nn.utils.rnn.pad_sequence(batch_input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id).to(self.device)
-        padded_mask = torch.nn.utils.rnn.pad_sequence(batch_attention_mask, batch_first=True, padding_value=0).to(self.device)
+        # Pad Sequence using tokenizer (handles left padding automatically)
+        batch = self.tokenizer.pad(
+            batch_features,
+            padding=True,
+            return_tensors='pt'
+        ).to(self.device)
+        
+        padded_input = batch['input_ids']
+        padded_mask = batch['attention_mask']
         
         # Generate
         try:
@@ -277,9 +284,11 @@ class VectorizedRealSystemEnv:
         gen_texts = []
         gen_ids = []
         
+        input_len = padded_input.shape[1]
+        
         for i in range(self.num_envs):
-            in_len = len(batch_input_ids[i])
-            out_ids = outputs[i][in_len:].tolist()
+            # 只需要截取生成部分 (跳过 input_ids)
+            out_ids = outputs[i][input_len:].tolist()
             
             # 去除 padding
             # 如果存在 eos 则截断
