@@ -45,8 +45,8 @@ class VectorizedRealSystemEnv:
         try:
             from modelscope import snapshot_download
             local_model_path = snapshot_download(self.model_name)
-            self.tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True)
-            self.tokenizer.padding_side = 'left' # 批量生成必须左填充
+            self.tokenizer = AutoTokenizer.from_pretrained(local_model_path, trust_remote_code=True, padding_side='left')
+            # 批量生成必须左填充 (已在 from_pretrained 中设置)
             self.model = AutoModelForCausalLM.from_pretrained(
                 local_model_path,
                 torch_dtype="auto", # 回归模型的默认精度

@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import torch
 import sys
 import os
+from tqdm import tqdm
 
 from configs.config import Config
 from utils.logger import setup_logger
@@ -43,7 +44,8 @@ def train():
     # 初始观测 (Batch)
     obs = env.reset()
     
-    for update in range(num_updates):
+    # 使用 tqdm 包装外层循环
+    for update in tqdm(range(num_updates), desc="Training Updates", unit="update"):
         # 存储当前更新周期的奖励
         episode_rewards = np.zeros(Config.NUM_ENVS)
         
@@ -56,7 +58,8 @@ def train():
         
         STEPS_PER_UPDATE = 10 
         
-        for step in range(STEPS_PER_UPDATE):
+        # 使用 tqdm 包装内层循环，leave=False 表示完成后清除进度条
+        for step in tqdm(range(STEPS_PER_UPDATE), desc="Collecting Steps", leave=False, unit="step"):
             # 1. 准备状态
             # obs 已经是批次字典: {'hidden_states': (32, ...), 'resource_states': (32, ...)}
             state = {

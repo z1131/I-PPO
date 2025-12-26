@@ -14,3 +14,4 @@ sentencepiece==0.1.99
 cmake
 openai
 modelscope
+tqdm
