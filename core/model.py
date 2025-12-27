@@ -3,46 +3,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class AttentionAggregation(nn.Module):
-    """
-    【核心模块 1】注意力语义聚合 (ASA)
-    
-    作用：把不管多长的输入序列 (Hidden States)，都通过注意力机制压缩成一个固定长度的向量。
-    就像人看文章，不管文章多长，最后脑子里记住的只是几个关键点。
-    """
+
+class KeyPointGate(nn.Module):
+    """线性门控：判断当前 token 是否为关键点。"""
+
     def __init__(self, input_dim):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+
+    def forward(self, hidden_vec):
         """
-        input_dim: 输入特征的维度 (比如 1024)
+        hidden_vec: (Batch, Dim)
+        返回 gated 向量和门控概率。
         """
-        super(AttentionAggregation, self).__init__()
-        
-        # 这里的 query 是一个可训练的参数，相当于智能体脑子里的“关注点”。
-        # 它会去和输入的每一个词进行比对，看看哪个词更重要。
-        self.query = nn.Parameter(torch.randn(input_dim, 1))
-        
-    def forward(self, hidden_states, mask=None):
+        gate_logits = self.linear(hidden_vec)  # (Batch, 1)
+        gate_probs = torch.sigmoid(gate_logits)
+        gated_hidden = hidden_vec * gate_probs
+        return gated_hidden, gate_probs
+
+
+class TransformerAggregator(nn.Module):
+    """单层 Transformer，用于替换原来的 ASA 聚合。"""
+
+    def __init__(self, input_dim, nhead=4):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=input_dim,
+            nhead=nhead,
+            dim_feedforward=input_dim * 4,
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+
+    def forward(self, hidden_states):
         """
-        前向传播计算。
-        输入:
-            hidden_states: (Batch, Seq_Len, Dim)
-            mask: (Batch, Seq_Len) 0/1 掩码，1表示有效，0表示Padding
+        hidden_states: (Batch, Seq_Len, Dim)
+        返回 Transformer 编码后的 [CLS] 等价向量（此处取第一个位置）。
         """
-        # (Batch, Seq_Len, 1)
-        scores = torch.matmul(hidden_states, self.query)
-        
-        # Masking strategy
-        if mask is not None:
-             # 将 Padding 位置的分数设为极小值 (-1e9)，这样 Softmax 后概率为 0
-             # mask 需要扩展维度适配 scores
-             extended_mask = mask.unsqueeze(-1) # (Batch, Seq, 1)
-             scores = scores.masked_fill(extended_mask == 0, -1e9)
-        
-        weights = F.softmax(scores, dim=1) 
-        
-        # (Batch, 1, Dim)
-        v_sem = torch.matmul(hidden_states.transpose(1, 2), weights).squeeze(-1)
-        
-        return v_sem
+        transformed = self.encoder(hidden_states)
+        return transformed[:, 0, :]
 
 class DualHeadActor(nn.Module):
     """
@@ -60,12 +59,14 @@ class DualHeadActor(nn.Module):
              input_dim = getattr(config, 'INPUT_DIM', 2048)
              hidden_dim = getattr(config, 'HIDDEN_DIM', 256)
              num_blocks = getattr(config, 'MAX_BLOCKS', 100)
-        
-        self.asa_module = AttentionAggregation(input_dim)
         resource_dim = 4
-        
+
+        self.gate = KeyPointGate(input_dim)
+        self.transformer = TransformerAggregator(input_dim)
+        gate_dim = 1
+
         self.shared_net = nn.Sequential(
-            nn.Linear(input_dim + resource_dim, hidden_dim),
+            nn.Linear(input_dim + resource_dim + gate_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
@@ -76,26 +77,19 @@ class DualHeadActor(nn.Module):
         
     def forward(self, hidden_states, resource_states):
         """
-        输入:
+         输入:
              hidden_states: (Batch, Seq_Len, Dim)
              resource_states: [剩余显存, 网络延迟, 任务长度, 信息熵]
         """
-        # 1. 动态生成 Mask
-        # resource_states[:, 2] 存储了真实的 Sequence Length
-        # hidden_states.shape[1] 是当前 Batch 的最大填充长度
-        batch_size, max_len, _ = hidden_states.shape
-        seq_lengths = resource_states[:, 2].long() # 取出真实长度
+        # 1. 使用最后一个 token 的 hidden state 做门控
+        last_hidden = hidden_states[:, -1, :]
+        gated_hidden, gate_probs = self.gate(last_hidden)
         
-        # 生成 Mask: (Batch, Max_Len)
-        # arange: [0, 1, ..., max-1]
-        # mask[i, j] = 1 if j < seq_len[i] else 0
-        mask = torch.arange(max_len).expand(batch_size, max_len).to(hidden_states.device) < seq_lengths.unsqueeze(1)
+        # 2. Transformer 聚合 (序列长度通常为 1)
+        transformer_out = self.transformer(gated_hidden.unsqueeze(1))
         
-        # 2. ASA 聚合 (带 Mask)
-        v_sem = self.asa_module(hidden_states, mask)
-        
-        # 3. 拼接
-        combined_input = torch.cat([v_sem, resource_states], dim=1)
+        # 3. 拼接门控概率与资源特征
+        combined_input = torch.cat([transformer_out, resource_states, gate_probs], dim=1)
         
         # 4. 共享特征提取
         features = self.shared_net(combined_input)
@@ -106,7 +100,7 @@ class DualHeadActor(nn.Module):
         
         caching_scores = torch.sigmoid(self.caching_head(features))
         
-        return router_probs, caching_scores
+        return router_probs, caching_scores, gate_probs
 
 class Critic(nn.Module):
     """
@@ -124,11 +118,13 @@ class Critic(nn.Module):
              hidden_dim = getattr(config, 'HIDDEN_DIM', 256)
              
         resource_dim = 4
-        
-        self.asa_module = AttentionAggregation(input_dim)
-        
+
+        self.gate = KeyPointGate(input_dim)
+        self.transformer = TransformerAggregator(input_dim)
+        gate_dim = 1
+
         self.net = nn.Sequential(
-            nn.Linear(input_dim + resource_dim, hidden_dim),
+            nn.Linear(input_dim + resource_dim + gate_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -136,12 +132,9 @@ class Critic(nn.Module):
         )
         
     def forward(self, hidden_states, resource_states):
-        # 生成 mask（和 Actor 一样的逻辑）
-        batch_size, max_len, _ = hidden_states.shape
-        seq_lengths = resource_states[:, 2].long()
-        mask = torch.arange(max_len).expand(batch_size, max_len).to(hidden_states.device) < seq_lengths.unsqueeze(1)
-        
-        v_sem = self.asa_module(hidden_states, mask)
-        combined = torch.cat([v_sem, resource_states], dim=1)
+        last_hidden = hidden_states[:, -1, :]
+        gated_hidden, gate_probs = self.gate(last_hidden)
+        transformer_out = self.transformer(gated_hidden.unsqueeze(1))
+        combined = torch.cat([transformer_out, resource_states, gate_probs], dim=1)
         value = self.net(combined)
         return value

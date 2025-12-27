@@ -2,22 +2,32 @@ import os
 import torch
 
 class Config:
-    # --- 路径与资源配置 ---
-    # 模型配置
+    # --- 路径配置 ---
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
+    MODELS_DIR = os.path.join(ASSETS_DIR, "models")
+    DATASETS_DIR = os.path.join(ASSETS_DIR, "datasets")
+    LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+    CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
+    
+    # --- 模型配置 ---
     MODEL_NAME = "Qwen/Qwen3-1.7B"
-    # 如果需要，可以使用 ModelScope 缓存路径逻辑或自定义路径
     
     # 云端 API 配置
-    CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "sk-277e287188874fc98b55edad9e498fbb")
-    CLOUD_BASE_URL = os.getenv("CLOUD_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    CLOUD_MODEL_NAME = os.getenv("CLOUD_MODEL_NAME", "qwen-max")
-
-    # 日志与检查点
-    LOG_DIR = "./logs"
-    CHECKPOINT_DIR = "./checkpoints"
+    CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "sk-gy23faA0CAruuR7GgHlFwA")
+    CLOUD_BASE_URL = os.getenv("CLOUD_BASE_URL", "https://llmapi.paratera.com")
+    CLOUD_MODEL_NAME = os.getenv("CLOUD_MODEL_NAME", "Qwen3-235B-A22B-Instruct-2507")
 
     # --- 训练超参数 ---
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # 自动识别可用 GPU 列表
+    if torch.cuda.is_available():
+        # 默认使用所有可见 GPU，或者用户指定 [0, 1, 2, 3]
+        GPU_COUNT = torch.cuda.device_count()
+        GPU_IDS = list(range(GPU_COUNT)) 
+        DEVICE = f'cuda:{GPU_IDS[0]}' # Agent 默认放在第一张卡
+    else:
+        GPU_IDS = []
+        DEVICE = 'cpu'
     
     # PPO 超参数
     LR_ACTOR = 3e-4
@@ -27,32 +37,48 @@ class Config:
     K_EPOCHS = 4
     
     # 模型架构
-    INPUT_DIM = 2048  # Qwen3-1.7B 维度
+    INPUT_DIM = 2048  # Qwen3-1.7B 维度 (务必确认模型维度)
     HIDDEN_DIM = 256
     ACTION_DIM = 2
     
     # 环境设置
-    NUM_ENVS = 8    # 并行环境数量 (向量化)
+    NUM_ENVS = 32    # 并行环境数量
     MAX_BLOCKS = 100
-    BLOCK_SIZE = 16  # KV Cache 管理中每块的 Token 数
-    MAX_TURNS = 5
+    BLOCK_SIZE = 16
+    
+    # --- 关键优化: 限制生成长度以对齐 PPO Update ---
+    # 设为 64 用于快速验证 (保证 Update 包含 Reward)
+    # 正式跑 LongBench 时可调大到 512 或 1024
+    MAX_NEW_TOKENS = 64 
+    
     LAMBDA_OOM = -10.0
     
     # 训练循环
-    NUM_EPISODES = 200 # 总 Episode 数 (在循环中会被 NUM_ENVS 除)
-    BATCH_SIZE = 128   # PPO 更新的 Batch Size (SGD 的 Mini-batch 大小)
+    NUM_EPISODES = 200
+    BATCH_SIZE = 512 # Mini-batch size
+
+    # 奖励调整系数
+    LOCAL_DELAY_COEF = 0.05
+    CLOUD_DELAY_COEF = 0.05
+    GATE_PENALTY_COEF = 0.1
+    BLOCK_PENALTY_COEF = 0.01
     
-    # --- 数据集 ---
-    # 格式: (数据集名称, 子集名称, 划分列表)
+    # --- 数据处理配置 ---
+    SKIP_FAILED_SAMPLES = True  # 失败样本跳过而非 mock
+    MAX_SAMPLE_FAILURES_LOG = 100  # 最多记录的失败样本数
+    
+    # --- 数据集配置 ---
+    # 格式: (数据集名称, 子集名称, 划分列表, 来源)
+    # 来源: 'modelscope' 或 'huggingface'
     DATASETS = [
-        ('opencompass/commonsense_qa', None, ['train', 'validation']),
-        ('opencompass/openbookqa', None, ['train', 'validation']),
-        ('modelscope/ai2_arc', 'ARC-Challenge', ['train', 'validation']),
-        ('AI-ModelScope/MATH-500', 'default', ['test'])
-    ]
-    
-    # OpenBookQA 特定哈希值 (用于手动回退加载)
-    OBQA_HASHES = [
-        "e75c8e10b17b225fe6ba56975e5a127ceaee377fa051718b77b6293864d969d9", # validation
-        "cdeb713ead8b41f116c430120af974c8beddc7caa52d84bb28bc9a6cea7778bd"  # train
+        # 短文本 QA (100-500 tokens)
+        ('opencompass/commonsense_qa', None, ['train', 'validation'], 'modelscope'),
+        ('opencompass/openbookqa', None, ['train', 'validation'], 'modelscope'),
+        ('modelscope/ai2_arc', 'ARC-Challenge', ['train', 'validation'], 'modelscope'),
+        ('AI-ModelScope/MATH-500', 'default', ['test'], 'modelscope'),
+        # 中等长度 (~5000 tokens)
+        ('nyu-mll/quality', None, ['train', 'validation'], 'huggingface'),
+        # 长文本 (8k-32k tokens) - LongBench 单文档 QA
+        ('THUDM/LongBench', 'qasper', ['test'], 'huggingface'),
+        ('THUDM/LongBench', 'multifieldqa_en', ['test'], 'huggingface'),
     ]

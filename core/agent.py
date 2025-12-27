@@ -7,7 +7,7 @@ import numpy as np
 
 class PPOAgent:
     """
-    【大脑】ASA-PPO 智能体 (支持向量化)
+    【大脑】I-PPO 智能体 (支持向量化)
     """
     def __init__(self, config):
         self.config = config
@@ -19,6 +19,7 @@ class PPOAgent:
             self.gamma = config.get('gamma', 0.99)
             self.clip = config.get('eps_clip', 0.2)
             self.k_epochs = config.get('K_epochs', 4)
+            self.num_envs = config.get('num_envs', 1)
         else:
             self.device = getattr(config, 'DEVICE', 'cpu')
             self.lr_actor = getattr(config, 'LR_ACTOR', 1e-4)
@@ -26,6 +27,7 @@ class PPOAgent:
             self.gamma = getattr(config, 'GAMMA', 0.99)
             self.clip = getattr(config, 'EPS_CLIP', 0.2)
             self.k_epochs = getattr(config, 'K_EPOCHS', 4)
+            self.num_envs = getattr(config, 'NUM_ENVS', 1)
         
         self.actor = DualHeadActor(config).to(self.device)
         self.critic = Critic(config).to(self.device)
@@ -37,152 +39,216 @@ class PPOAgent:
         
         self.mse_loss = nn.MSELoss()
         
-        self.memory = []
-        # log_prob 存储需要处理 batch
+        # 向量化 Memory: 为每个环境维护独立的 Buffer
+        self.memories = [[] for _ in range(self.num_envs)]
+        
         self.current_log_prob = None 
+        self.current_gate_usage = None
         
     def get_action(self, state):
-        """
-        批量动作选择 (Batch Action Selection)
-        输入 state: 
-            'hidden_states': (Batch, Seq_Len, Dim) 
-            'resource_states': (Batch, 4)
-        """
-        # 1. 转换为张量
-        # 状态输入已经是来自 VectorizedEnv 的批次 numpy 数组
+        """批量动作选择"""
         hidden_states = torch.FloatTensor(state['hidden_states']).to(self.device) 
         resource_states = torch.FloatTensor(state['resource_states']).to(self.device)
         
-        # 确保维度 (Batch, Seq, Dim)
-        if hidden_states.dim() == 2: # 如果是 (Batch, Dim) - 发生在 Seq=1 时? 
-            # 等等，Env 返回 (Batch, Dim) 因为它提取了最后一个 Token 的 hidden state
-            # 但是 Model 期望 (Batch, Seq, Dim)。
-            # 我们需要 unsqueeze 变成 (Batch, 1, Dim) 给 Actor
+        if hidden_states.dim() == 2: 
             hidden_states = hidden_states.unsqueeze(1)
         
-        # 2. 前向传播
         with torch.no_grad():
-            router_probs, caching_probs = self.actor(hidden_states, resource_states)
+            router_probs, caching_probs, gate_probs = self.actor(hidden_states, resource_states)
         
-        # 3. 采样路由 (Batch)
         dist_route = Categorical(router_probs)
-        action_route = dist_route.sample() # (Batch,)
-        log_prob_route = dist_route.log_prob(action_route) # (Batch,)
+        action_route = dist_route.sample()
+        log_prob_route = dist_route.log_prob(action_route)
         
-        # 4. 采样缓存 (Batch)
         dist_cache = torch.distributions.Bernoulli(caching_probs)
-        action_cache_mask = dist_cache.sample() # (Batch, 100)
-        log_prob_cache = dist_cache.log_prob(action_cache_mask).sum(dim=-1) # (Batch,)
+        action_cache_mask = dist_cache.sample()
+        log_prob_cache = dist_cache.log_prob(action_cache_mask).sum(dim=-1)
         
-        # 5. 总 Log Prob
-        total_log_prob = log_prob_route + log_prob_cache # (Batch,)
+        total_log_prob = log_prob_route + log_prob_cache
         
-        # 存储以供 store_experience 循环使用 (Numpy 方便索引)
         self.current_log_prob = total_log_prob.cpu().numpy()
+        self.current_gate_usage = gate_probs.squeeze(-1).cpu().numpy()
         
-        return action_route.cpu().numpy(), action_cache_mask.cpu().numpy()
+        return action_route.cpu().numpy(), action_cache_mask.cpu().numpy(), self.current_gate_usage
+        
+    def get_value(self, state):
+        """辅助方法：获取当前状态的 Value (用于 Bootstrap)"""
+        hidden_states = torch.FloatTensor(state['hidden_states']).to(self.device)
+        resource_states = torch.FloatTensor(state['resource_states']).to(self.device)
+        
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)
+            
+        with torch.no_grad():
+            values = self.critic(hidden_states, resource_states).squeeze()
+        return values.cpu().numpy() # (Batch,)
 
-    def store_experience(self, state, action, reward, next_state, done, log_prob=None):
-        """
-        存储单个经验。
-        注意: PPOAgent.update() 期望字典列表。
-        如果使用向量化 Env，调用者会循环调用此方法 N 次。
-        """
+    def store_experience(self, env_idx, state, action, reward, done, log_prob=None):
+        """存储单个经验到指定环境的 Buffer"""
         action_route, action_cache_mask = action
         
-        # 如果明确传递了 log_prob (推荐)，则使用它。
-        # 如果没有，尝试使用 self.current_log_prob (在循环中有风险)
-        val_log_prob = log_prob
-        if val_log_prob is None:
-             # 回退逻辑 (假设 batch size 为 1 或外部管理)
-             pass
-
-        self.memory.append({
+        self.memories[env_idx].append({
             'hidden_states': state['hidden_states'],
             'resource_states': state['resource_states'],
             'action_route': action_route,
             'action_cache_mask': action_cache_mask,
-            'log_prob': torch.tensor(val_log_prob) if val_log_prob is not None else torch.tensor(0.0), # 占位修复
+            'log_prob': log_prob if log_prob is not None else 0.0,
             'reward': reward,
             'done': done
         })
 
-    def update(self):
+    def update(self, next_values=None):
         """
-        标准 PPO 更新 (逻辑不变，只是现在处理更多数据)
+        PPO Update with Vectorized Support & GAE
+        next_values: (num_envs,) 数组，用于 Bootstrap 未完成的 Episode
         """
-        if not self.memory:
+        # 检查是否有数据
+        if not any(self.memories):
             return 0.0
             
-        # 1. 准备 Batch
-        # Hidden States: list of (Dim,) -> (Batch, 1, Dim)
-        raw_hidden = [torch.FloatTensor(x['hidden_states']) for x in self.memory]
-        hidden_states = torch.stack(raw_hidden).unsqueeze(1).to(self.device)
+        # 1. 整理所有环境的数据并计算 Advantage
+        all_hidden_states = []
+        all_resource_states = []
+        all_actions_route = []
+        all_actions_cache = []
+        all_old_log_probs = []
+        all_advantages = []
+        all_returns = []
         
-        resource_states = torch.FloatTensor(np.array([x['resource_states'] for x in self.memory])).to(self.device)
-        actions_route = torch.LongTensor([x['action_route'] for x in self.memory]).to(self.device)
-        actions_cache_mask = torch.FloatTensor(np.array([x['action_cache_mask'] for x in self.memory])).to(self.device)
-        old_log_probs = torch.stack([x['log_prob'] for x in self.memory]).to(self.device).detach()
+        # 为了高效计算 Value，我们是否应该先 Batch 跑一遍 Critic?
+        # 考虑到代码复杂度，我们可以先按 Env 跑，或者把所有 obs 拼起来跑。
+        # 这里为了实现最准确的 GAE，我们需要每个 Trajectory 的 Values。
+        # 简单起见，我们在 Loop 里对每个 Env 的 Trajectory 单独处理 (因为长度可能稍有不同 in theory, though synchronized here)
         
-        rewards = [x['reward'] for x in self.memory]
-        is_terminals = [x['done'] for x in self.memory]
+        gae_lambda = 0.95 # GAE lambda 参数
         
-        # 2. Rewards to Go (折扣奖励)
-        rewards_to_go = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(rewards), reversed(is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards_to_go.insert(0, discounted_reward)
+        for i in range(self.num_envs):
+            traj = self.memories[i]
+            if not traj:
+                continue
+                
+            # 提取该环境的 Trajectory 数据
+            # Hidden: (T, Dim) -> (T, 1, Dim)
+            raw_h = [step['hidden_states'] for step in traj]
+            env_hidden = torch.FloatTensor(np.array(raw_h)).unsqueeze(1).to(self.device)
             
-        rewards_to_go = torch.FloatTensor(rewards_to_go).to(self.device)
-        if rewards_to_go.std() > 1e-5:
-            rewards_to_go = (rewards_to_go - rewards_to_go.mean()) / (rewards_to_go.std() + 1e-5)
+            raw_r = [step['resource_states'] for step in traj]
+            env_resource = torch.FloatTensor(np.array(raw_r)).to(self.device)
             
-        # 3. 优化 (Optimization)
-        loss_val = 0
+            rewards = [step['reward'] for step in traj]
+            dones = [step['done'] for step in traj]
+            
+            # 计算 Values (当前策略)
+            with torch.no_grad():
+                values = self.critic(env_hidden, env_resource).squeeze(-1) # (T,)
+            
+            # GAE Calculation
+            advantages = []
+            last_advantage = 0
+            
+            # Bootstrap Value
+            # 如果提供了 next_values，则用它；否则假设为 0 (Done)
+            next_val = next_values[i] if next_values is not None else 0.0
+            
+            # 倒序计算
+            for t in reversed(range(len(rewards))):
+                if t == len(rewards) - 1:
+                    non_terminal = 1.0 - float(dones[t]) # 如果 done，则没有未来
+                    next_term_val = next_val * non_terminal
+                else:
+                    non_terminal = 1.0 - float(dones[t])
+                    next_term_val = values[t+1] * non_terminal
+                
+                delta = rewards[t] + self.gamma * next_term_val - values[t]
+                advantage = delta + self.gamma * gae_lambda * non_terminal * last_advantage
+                last_advantage = advantage
+                advantages.insert(0, advantage)
+            
+            # 计算 Returns = Advantage + Value
+            returns = [adv + val for adv, val in zip(advantages, values.cpu().numpy())]
+            
+            # 存入汇总列表
+            all_hidden_states.extend(raw_h)
+            all_resource_states.extend(raw_r)
+            all_actions_route.extend([step['action_route'] for step in traj])
+            all_actions_cache.extend([step['action_cache_mask'] for step in traj])
+            all_old_log_probs.extend([step['log_prob'] for step in traj])
+            all_advantages.extend(advantages)
+            all_returns.extend(returns)
+            
+        # 2. 转换为 Tensor (Batch)
+        # 注意: 此时所有环境的所有 timestep 都被 flatten 到了一起
+        batch_hidden = torch.FloatTensor(np.array(all_hidden_states)).unsqueeze(1).to(self.device)
+        batch_resource = torch.FloatTensor(np.array(all_resource_states)).to(self.device)
+        batch_route = torch.LongTensor(np.array(all_actions_route)).to(self.device)
+        batch_cache = torch.FloatTensor(np.array(all_actions_cache)).to(self.device)
+        batch_log_probs = torch.FloatTensor(np.array(all_old_log_probs)).to(self.device)
+        batch_advantages = torch.FloatTensor(np.array(all_advantages)).to(self.device)
+        batch_returns = torch.FloatTensor(np.array(all_returns)).to(self.device)
         
-        # Mini-batch 支持? Config.BATCH_SIZE 在这里使用?
-        # 目前是 Full-batch 更新 (所有收集到的步骤)。
+        # 归一化 Advantage
+        if batch_advantages.std() > 1e-5:
+            batch_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std() + 1e-5)
+            
+        # 3. Mini-batch PPO Update
+        total_steps = batch_hidden.size(0)
+        indices = np.arange(total_steps)
+        mini_batch_size = self.config.BATCH_SIZE
+        
+        avg_loss = 0
+        updates_count = 0
         
         for _ in range(self.k_epochs):
-            # 评估
-            current_router_probs, current_caching_probs = self.actor(hidden_states, resource_states)
+            np.random.shuffle(indices)
             
-            dist_route = Categorical(current_router_probs)
-            log_prob_route = dist_route.log_prob(actions_route)
-            
-            dist_cache = torch.distributions.Bernoulli(current_caching_probs)
-            log_prob_cache = dist_cache.log_prob(actions_cache_mask).sum(dim=-1)
-            
-            current_log_probs = log_prob_route + log_prob_cache
-            
-            entropy_route = dist_route.entropy()
-            entropy_cache = dist_cache.entropy().mean(dim=-1)
-            
-            state_values = self.critic(hidden_states, resource_states).squeeze()
-            
-            # 匹配维度
-            if state_values.dim() == 0: state_values = state_values.unsqueeze(0)
-            
-            advantages = rewards_to_go - state_values.detach()
-            
-            ratio = torch.exp(current_log_probs - old_log_probs)
-            
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1-self.clip, 1+self.clip) * advantages
-            
-            loss_actor = -torch.min(surr1, surr2).mean()
-            loss_critic = self.mse_loss(state_values, rewards_to_go)
-            total_entropy = entropy_route.mean() + entropy_cache.mean()
-            
-            loss = loss_actor + 0.5 * loss_critic - 0.01 * total_entropy
-            loss_val = loss.item()
-            
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            
-        self.memory = []
-        return loss_val
+            for start in range(0, total_steps, mini_batch_size):
+                end = start + mini_batch_size
+                mb_idx = indices[start:end]
+                
+                # Slicing
+                mb_hidden = batch_hidden[mb_idx]
+                mb_resource = batch_resource[mb_idx]
+                mb_route = batch_route[mb_idx]
+                mb_cache = batch_cache[mb_idx]
+                mb_old_log_probs = batch_log_probs[mb_idx]
+                mb_advantages = batch_advantages[mb_idx]
+                mb_returns = batch_returns[mb_idx]
+                
+                # Forward Actor
+                curr_route_probs, curr_cache_probs, _ = self.actor(mb_hidden, mb_resource)
+                
+                dist_route = Categorical(curr_route_probs)
+                log_prob_route = dist_route.log_prob(mb_route)
+                
+                dist_cache = torch.distributions.Bernoulli(curr_cache_probs)
+                log_prob_cache = dist_cache.log_prob(mb_cache).sum(dim=-1)
+                
+                curr_log_probs = log_prob_route + log_prob_cache
+                
+                entropy = dist_route.entropy().mean() + dist_cache.entropy().mean(dim=-1).mean()
+                
+                # Forward Critic
+                state_values = self.critic(mb_hidden, mb_resource).squeeze()
+                
+                # Ratios
+                ratio = torch.exp(curr_log_probs - mb_old_log_probs)
+                
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1-self.clip, 1+self.clip) * mb_advantages
+                
+                loss_actor = -torch.min(surr1, surr2).mean()
+                loss_critic = self.mse_loss(state_values, mb_returns)
+                
+                loss = loss_actor + 0.5 * loss_critic - 0.01 * entropy
+                
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                
+                avg_loss += loss.item()
+                updates_count += 1
+                
+        # 清空所有环境的 Memory
+        self.memories = [[] for _ in range(self.num_envs)]
+        
+        return avg_loss / updates_count if updates_count > 0 else 0.0

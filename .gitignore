@@ -39,10 +39,13 @@ checkpoints/
 *.png
 *.log
 
+# Assets (模型与数据集本地缓存)
+assets/
+
 # Models & Datasets (cached by modelscope/transformers)
 .cache/
-data/
 
 # Secrets
 .env
 deepknow.env
+

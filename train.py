@@ -56,7 +56,12 @@ def train():
         # 我们运行直到大致所有环境都完成了 MAX_TURNS 步？
         # 不，更简单的方法：运行固定步数 (例如 10 步)，然后更新。
         
-        STEPS_PER_UPDATE = 10 
+        # 56: 我们运行直到大致所有环境都完成了 MAX_TURNS 步？
+        # 57: 不，更简单的方法：运行固定步数 (例如 10 步)，然后更新。
+        
+        # 增加步数以减少 Bootstrap 偏差并提高 Batch 效率
+        # 动态对齐：让更新步数等于最大生成长度，确保覆盖完整的 Episode Horizon
+        STEPS_PER_UPDATE = getattr(Config, 'MAX_NEW_TOKENS', 100)
         
         # 使用 tqdm 包装内层循环，leave=False 表示完成后清除进度条
         for step in tqdm(range(STEPS_PER_UPDATE), desc="Collecting Steps", leave=False, unit="step"):
@@ -69,10 +74,10 @@ def train():
             
             # 2. Agent 决策 (Batch)
             # agent.get_action 需要处理批次输入
-            action_route, action_cache_mask = agent.get_action(state)
+            action_route, action_cache_mask, gate_usage = agent.get_action(state)
             
             # 3. 环境步进 (向量化)
-            next_obs, rewards, dones, infos = env.step(action_route, action_cache_mask)
+            next_obs, rewards, dones, infos = env.step(action_route, action_cache_mask, gate_usage)
             
             # 4. 存储经验
             # 使用 agent 的 current_log_prob，它存储了向量
@@ -85,19 +90,27 @@ def train():
                 }
                 
                 agent.store_experience(
+                    i, # env_idx (!!! Critical Fix !!!)
                     single_state, 
                     (action_route[i], action_cache_mask[i]), 
                     rewards[i], 
-                    None, 
                     dones[i],
-                    log_prob=log_probs[i] # 传递明确的标量
+                    log_prob=log_probs[i]
                 )
             
             episode_rewards += rewards # 累加用于日志记录
             obs = next_obs
         
-        # 5. 更新 Agent
-        loss = agent.update()
+        # 5. 计算 Bootstrap Values (Next State Value)
+        # obs 现在持有的是所有环境在 T+1 时刻的状态
+        state_next = {
+            'hidden_states': obs['hidden_states'],
+            'resource_states': obs['resource_states']
+        }
+        next_values = agent.get_value(state_next) # (NUM_ENVS,)
+
+        # 6. 更新 Agent
+        loss = agent.update(next_values)
         
         # 6. 日志记录
         avg_rew = np.mean(episode_rewards)
